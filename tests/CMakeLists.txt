@@ -41,15 +41,13 @@ set_target_properties(check-tests PROPERTIES FOLDER "Tests")
 add_lit_testsuites(BUDDY ${CMAKE_CURRENT_SOURCE_DIR} DEPENDS ${BUDDY_TEST_DEPENDS})
 
 #------------------------------------------------------------------------------------
-#    E2E test module ⬇️
+#    E2E test module
 #------------------------------------------------------------------------------------
 
 option(BUDDY_ENABLE_E2E_TESTS "Enable end-to-end (E2E) tests for Models" OFF)
 
 if(BUDDY_ENABLE_E2E_TESTS)
-
   add_subdirectory(Models)
-
   set(BUDDY_MODELS_TEST_DEPENDS
   ${BUDDY_TEST_DEPENDS}
   buddy-lenet-run-test-cpu
@@ -64,4 +62,3 @@ if(BUDDY_ENABLE_E2E_TESTS)
   add_lit_testsuites(BUDDY_MODELS ${CMAKE_CURRENT_SOURCE_DIR}/Models DEPENDS ${BUDDY_MODELS_TEST_DEPENDS})
 
 endif()
-

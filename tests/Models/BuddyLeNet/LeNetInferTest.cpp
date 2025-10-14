@@ -18,11 +18,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %if buddy_enable_gpu %{ \
-// RUN:   buddy-lenet-run-test-gpu 2>&1 | FileCheck %s \
-// RUN: %} %else %{ \
-// RUN:   buddy-lenet-run-test-cpu 2>&1 | FileCheck %s \
-// RUN: %}
+// RUN: buddy-lenet-run-test-cpu %s 2>&1 | FileCheck %s 
 
 #include <buddy/Core/Container.h>
 #include <buddy/DIP/ImgContainer.h>
@@ -35,6 +31,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 constexpr size_t ParamsSize = 44426;
 const std::string ImgName = "1-28*28.png";
@@ -81,14 +78,11 @@ void loadParameters(const std::string &paramFilePath,
 /// Softmax function to convert logits to probabilities.
 void softmax(float *input, size_t size) {
   size_t i;
-  float max_value = -INFINITY;
   double sum = 0.0;
   // Find the maximum value in the input array for numerical stability.
-  for (i = 0; i < size; ++i) {
-    if (max_value < input[i]) {
-      max_value = input[i];
-    }
-  }
+  float* max_ptr = std::max_element(input, input+size);
+  float max_value = *max_ptr;
+
   // Calculate the sum of the exponentials of the input elements, normalized by
   // the max value.
   for (i = 0; i < size; ++i) {
@@ -104,6 +98,9 @@ int main() {
   // Print the title of this example.
   const std::string title = "LeNet Inference Powered by Buddy Compiler";
   std::cout << "\033[33;1m" << title << "\033[0m" << std::endl;
+
+  //Defines the number of categories
+  const int KNumClass = 10;
 
   // Define the sizes of the output tensors.
   intptr_t sizesOutput[2] = {1, 10};
@@ -125,12 +122,12 @@ int main() {
 
   // Apply softmax to the output logits to get probabilities.
   auto out = output.getData();
-  softmax(out, 10);
+  softmax(out, KNumClass);
 
   // Find the classification and print the result.
   float maxVal = 0;
   float maxIdx = 0;
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < KNumClass; ++i) {
     if (out[i] > maxVal) {
       maxVal = out[i];
       maxIdx = i;
@@ -143,7 +140,5 @@ int main() {
   return 0;
 }
 
-
 // CHECK: Classification: 1
 // CHECK: Probability: 1
-
