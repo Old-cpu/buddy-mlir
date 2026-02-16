@@ -27,6 +27,7 @@ classicfuse_register = {
     "transpose_matmul_fusion": TransposeMatmulFusedOp,
     "flash_attention_prefill_fusion": FlashAttentionForCpuPrefillOp,
     "gqa_attention_fusion": GQAAttentionFusedOp,
+    "bias_add_fusion": MatmulWithAccOp,
 }
 
 # TODO: classify op type for op fusion
@@ -95,6 +96,208 @@ def transpose_matmul_fusion(
         graph.delete_node(target, targets_parent)
 
 
+def bias_add_fuse_check(graph: Graph):
+    """
+    Function to detect and fuse matmul + add (bias) pattern.
+    
+    Pattern: MatmulOp -> AddOp (where add's other input is a 1D bias tensor)
+    After fusion: MatmulWithAccOp (matmul with bias as accumulator)
+    
+    This fusion eliminates the separate add operation by using the bias
+    as the initial accumulator value in the matmul operation.
+    
+    Note: This does NOT fuse residual connections where the other input is
+    a large tensor (like the original input or a previous layer's output).
+    """
+    from ..operation import EmbeddingOp
+    
+    def get_shape_from_tensor_meta(tensor_meta):
+        """Helper function to get shape from tensor_meta (can be dict or object)."""
+        if tensor_meta is None:
+            return None
+        if isinstance(tensor_meta, dict):
+            return tensor_meta.get('shape', None)
+        elif hasattr(tensor_meta, 'shape'):
+            return tensor_meta.shape
+        return None
+    
+    # Collect all patterns first to avoid modifying graph during iteration
+    patterns_to_fuse = []
+    matmul_count = 0
+    for op in list(graph.body):
+        if isinstance(op, MatmulOp):
+            matmul_count += 1
+            # Debug: print info for first few matmuls
+            if matmul_count <= 3:
+                print(f"[DEBUG] MatmulOp {op.name}")
+                for child_name in op._children:
+                    child = graph.node_table.get(child_name, None)
+                    if child and isinstance(child, (ViewOp, ReshapeOp)):
+                        print(f"[DEBUG]   - child view '{child_name}' args: {child.args}")
+                        for gc_name in child._children:
+                            gc = graph.node_table.get(gc_name, None)
+                            if gc and isinstance(gc, AddOp):
+                                print(f"[DEBUG]     - add '{gc_name}' args: {gc.args}, parents: {gc._parents}")
+                                for p_name in gc._parents:
+                                    if p_name != child.name:
+                                        p = graph.node_table.get(p_name, None)
+                                        if p:
+                                            print(f"[DEBUG]       - add parent '{p_name}' is {type(p).__name__}")
+                                            print(f"[DEBUG]         - args: {p.args}")
+                                            print(f"[DEBUG]         - tensor_meta: {p.tensor_meta}")
+            
+            # Check if matmul has a ViewOp/ReshapeOp as child
+            for child_name in op._children:
+                child = graph.node_table.get(child_name, None)
+                if child is None:
+                    continue
+                # Pattern: MatmulOp -> ViewOp/ReshapeOp -> AddOp
+                # But we need to check if the view is matmul's output, not bias's reshape
+                if isinstance(child, (ViewOp, ReshapeOp)):
+                    # Check if this view's input is the matmul output
+                    if op.name in child._parents or op.name in child.args:
+                        # This view is matmul's output reshape
+                        # Check if this view/reshape has an AddOp as child
+                        for grandchild_name in child._children:
+                            grandchild = graph.node_table.get(grandchild_name, None)
+                            if grandchild is None:
+                                continue
+                            if isinstance(grandchild, AddOp):
+                                # Find the bias input (the one that's not the view/reshape output)
+                                bias_parent = None
+                                for parent_name in grandchild._parents:
+                                    if parent_name != child.name:
+                                        bias_parent = parent_name
+                                        break
+                                if bias_parent:
+                                    # Check if bias_parent is a 1D tensor (bias) or a PlaceholderOp
+                                    # We only want to fuse if it's a bias tensor, not a residual connection
+                                    bias_node = graph.node_table.get(bias_parent)
+                                    if bias_node:
+                                        # Check if it's a PlaceholderOp with 1D shape (bias)
+                                        # or a ReshapeOp/EmbeddingOp that reshapes a 1D tensor
+                                        is_bias = False
+                                        if isinstance(bias_node, PlaceholderOp):
+                                            # Check tensor_meta for shape
+                                            shape = get_shape_from_tensor_meta(bias_node.tensor_meta)
+                                            if shape and len(shape) == 1:
+                                                is_bias = True
+                                        elif isinstance(bias_node, (ViewOp, ReshapeOp, EmbeddingOp)):
+                                            # Check if this reshape's input is a 1D tensor
+                                            for arg in bias_node.args:
+                                                if isinstance(arg, str):
+                                                    arg_node = graph.node_table.get(arg)
+                                                    if arg_node and isinstance(arg_node, PlaceholderOp):
+                                                        shape = get_shape_from_tensor_meta(arg_node.tensor_meta)
+                                                        if shape and len(shape) == 1:
+                                                            is_bias = True
+                                                            break
+                                        
+                                        if is_bias:
+                                            patterns_to_fuse.append((op, child, grandchild, bias_parent, "bias_add_fusion"))
+                                    break
+                        if patterns_to_fuse and patterns_to_fuse[-1][0] == op:
+                            break
+    
+    print(f"[bias_add_fuse_check] Found {matmul_count} MatmulOp, {len(patterns_to_fuse)} patterns to fuse")
+    
+    # Apply all fusions after collecting patterns
+    for matmul_op, view_op, add_op, bias_parent, pattern in patterns_to_fuse:
+        bias_add_fusion(graph, matmul_op, view_op, add_op, bias_parent, pattern)
+
+
+def bias_add_fusion(
+    graph: Graph, 
+    matmul_node: MatmulOp, 
+    view_op: Op,
+    add_op: AddOp, 
+    bias_parent_name: str,
+    pattern: str
+):
+    """
+    Fuse matmul + add (bias) into MatmulWithAccOp.
+    
+    The pattern is: MatmulOp -> ViewOp/ReshapeOp -> AddOp
+    After fusion: MatmulWithAccOp -> ViewOp/ReshapeOp
+    
+    The view/reshape operation is preserved for correct tensor shape handling.
+    
+    Args:
+        graph: The computation graph
+        matmul_node: The MatmulOp to be fused
+        view_op: The ViewOp/ReshapeOp between matmul and add
+        add_op: The AddOp that adds bias to matmul output
+        bias_parent_name: Name of the bias tensor node
+        pattern: The fusion pattern name
+    """
+    print(f"[bias_add_fusion] Fusing {matmul_node.name} + {add_op.name} with bias {bias_parent_name}")
+    
+    fuse_op = classicfuse_register.get(pattern)()
+    fuse_op.name = "fused_" + matmul_node.name
+    graph.displace_node(matmul_node, fuse_op)
+    
+    # Copy tensor metadata from original matmul
+    if hasattr(matmul_node, 'tensor_meta') and matmul_node.tensor_meta:
+        fuse_op.tensor_meta = matmul_node.tensor_meta.copy()
+    
+    # Add bias as the third argument to the fused op
+    fuse_op._parents.append(bias_parent_name)
+    fuse_op.args.append(bias_parent_name)
+    
+    print(f"[bias_add_fusion] fuse_op.name={fuse_op.name}, args={fuse_op.args}, _parents={fuse_op._parents}")
+    
+    # Update bias parent's children to point to fused op
+    bias_parent = graph.node_table.get(bias_parent_name)
+    if bias_parent:
+        if add_op.name in bias_parent._children:
+            idx = bias_parent._children.index(add_op.name)
+            bias_parent._children[idx] = fuse_op.name
+        else:
+            bias_parent.add_children(fuse_op.name)
+    
+    # The fused op's output goes to view_op (preserved)
+    fuse_op._children = [view_op.name]
+    
+    # Update view_op's parent to point to fused op
+    if matmul_node.name in view_op._parents:
+        idx = view_op._parents.index(matmul_node.name)
+        view_op._parents[idx] = fuse_op.name
+    if matmul_node.name in view_op.args:
+        idx = view_op.args.index(matmul_node.name)
+        view_op.args[idx] = fuse_op.name
+    
+    # Update add's children to use view_op's output (bypass add)
+    add_children = [
+        graph.node_table[child_name] 
+        for child_name in add_op._children
+    ]
+    for child in add_children:
+        if add_op.name in child._parents:
+            parent_idx = child._parents.index(add_op.name)
+            child._parents[parent_idx] = view_op.name
+        
+        if add_op.name in child.args:
+            arg_idx = child.args.index(add_op.name)
+            child.args[arg_idx] = view_op.name
+    
+    # Update view_op's children to point to add's children
+    view_op._children = add_op._children.copy()
+    
+    # Clear add op's connections
+    add_op._children.clear()
+    add_op._parents.clear()
+    
+    # Delete the add op
+    add_parents = []
+    for parent_name in [view_op.name, bias_parent_name]:
+        parent = graph.node_table.get(parent_name)
+        if parent and add_op.name in parent._children:
+            add_parents.append(parent)
+    
+    if graph.check_delete_node(add_op) and add_parents:
+        graph.delete_node(add_op, add_parents)
+
+
 def apply_classic_fusion(graph: Graph):
     """
     Function to fuse some typical operations into one operation and fuse
@@ -110,6 +313,7 @@ def apply_classic_fusion(graph: Graph):
     device = DeviceType.CPU
     # Run the first round of op fusion
     classic_fuse_check(graph)
+    bias_add_fuse_check(graph)
     for op in graph.body:
         if isinstance(op, PlaceholderOp):
             continue

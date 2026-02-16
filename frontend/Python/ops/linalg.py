@@ -1321,6 +1321,61 @@ def matmul_transpose_b_op(
     return op
 
 
+def matmul_bias_op(
+    node,
+    symbol_table: Dict[Tuple[str, int], ir.Operation],
+):
+    """
+    Matmul with bias add fusion.
+    Fuses matmul + add(bias) into a single matmul operation that uses
+    bias as the initial accumulator value.
+    """
+    if len(node.args) < 3:
+        raise ValueError(
+            f"MatmulWithAccOp requires 3 arguments, got {len(node.args)}"
+        )
+
+    input_a = symbol_table.get((str(node.args[0]), 0))
+    input_b = symbol_table.get((str(node.args[1]), 0))
+    bias = symbol_table.get((str(node.args[2]), 0))
+
+    if input_a is None or input_b is None or bias is None:
+        return None
+
+    dtype = node.tensor_meta["dtype"]
+    output_shape = list(node.tensor_meta["shape"])
+    mlir_dtype = mlir_element_type_get(dtype)
+    tensor_type = ir.RankedTensorType.get(output_shape, mlir_dtype)
+    generic_map = _safe_get_permutation([0, 1, 2])
+
+    # reshape bias to match matmul output shape
+    shape_ty = ir.Type.parse(f"!tosa.shape<{len(output_shape)}>")
+    index_ty = ir.IndexType.get()
+    shape_val = tosa.ConstShapeOp(
+        shape_ty,
+        ir.DenseElementsAttr.get(
+            array.array("q", output_shape),
+            type=index_ty,
+            shape=[len(output_shape)],
+        ),
+    ).result
+    bias_reshaped = tosa.ReshapeOp(bias, shape_val).result
+
+    op = linalg.MatmulOp(
+        result_tensors=[tensor_type],
+        inputs=[input_a, input_b],
+        outputs=[bias_reshaped],
+        indexing_maps=[
+            generic_map.get_submap([0, 2]),  # lhs: (m, k)
+            generic_map.get_submap([2, 1]),  # rhs: (k, n)
+            generic_map.get_submap([0, 1]),  # out: (m, n)
+        ],
+        cast="cast_signed",
+    )
+    linalg.fill_builtin_region(op.operation)
+    return op
+
+
 def transpose_op(
     node: TransposeOp,
     symbol_table: Dict[Tuple[str, int], ir.Operation],
@@ -9535,6 +9590,7 @@ def gru_op(
 ops_registry = {
     "MatmulOp": matmul_op,
     "TransposeMatmulFusedOp": matmul_transpose_b_op,
+    "MatmulWithAccOp": matmul_bias_op,
     "ArangeOp": arange_op,
     "UnsqueezeOp": unsqueeze_op,
     "ViewOp": view_op,

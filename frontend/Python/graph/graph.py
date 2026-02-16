@@ -401,6 +401,183 @@ class Graph:
         self._output_descriptor = make_output_memref_descriptor(
             output_ranks, output_dtypes
         )
+        
+        # Apply matmul + bias add fusion at MLIR level
+        self._fuse_matmul_bias_add()
+
+    def _fuse_matmul_bias_add(self):
+        """
+        Fuse matmul + bias add patterns at MLIR level.
+        
+        Pattern: linalg.matmul with zero output -> tosa.reshape(bias) -> tosa.add
+        After fusion: linalg.matmul with bias as output initial value
+        
+        This eliminates the separate add operation by using the bias
+        as the initial accumulator value in the matmul operation.
+        """
+        from mlir.dialects import linalg, tosa, arith
+        import array
+        
+        module = self._imported_module
+        if module is None:
+            return
+        
+        print("[_fuse_matmul_bias_add] Starting MLIR-level fusion...")
+        
+        # Use the module's context
+        with ir.Location.unknown(self._ctx):
+            # Walk through all operations in the module
+            for func_op in module.body.operations:
+                if not hasattr(func_op, 'body'):
+                    continue
+                
+                # Collect matmul + add patterns to fuse
+                patterns_to_fuse = []
+                
+                for block in func_op.body.blocks:
+                    for op in list(block.operations):
+                        # Check if this is a tosa.add operation
+                        op_name = op.name if hasattr(op, 'name') else None
+                        if op_name and 'tosa.add' in op_name:
+                            # Get the two inputs of the add
+                            if len(op.operands) != 2:
+                                continue
+                            
+                            input1 = op.operands[0]
+                            input2 = op.operands[1]
+                            
+                            print(f"[_fuse_matmul_bias_add] Found tosa.add with inputs")
+                            
+                            # Check if one input is from a linalg.matmul
+                            matmul_op = None
+                            bias_input = None
+                            reshape_op = None
+                            
+                            for inp in [input1, input2]:
+                                if hasattr(inp, 'owner'):
+                                    owner = inp.owner
+                                    owner_name = owner.name if hasattr(owner, 'name') else None
+                                    print(f"[_fuse_matmul_bias_add]   - input owner name: {owner_name}")
+                                    # Check if it's a linalg.matmul
+                                    if owner_name and 'linalg.matmul' in owner_name:
+                                        matmul_op = owner
+                                        bias_input = input2 if inp == input1 else input1
+                                        break
+                                    # Check if it's a tosa.reshape (bias reshape)
+                                    elif owner_name and 'tosa.reshape' in owner_name:
+                                        reshape_op = owner
+                            
+                            if matmul_op is None:
+                                print(f"[_fuse_matmul_bias_add]   - No matmul found, skipping")
+                                continue
+                            
+                            print(f"[_fuse_matmul_bias_add]   - Found matmul!")
+                            
+                            # Check if the bias input is from a reshape of a 1D tensor
+                            if reshape_op is not None and len(reshape_op.operands) > 0:
+                                bias_source = reshape_op.operands[0]
+                                if hasattr(bias_source, 'type'):
+                                    bias_shape = ir.RankedTensorType(bias_source.type).shape
+                                    print(f"[_fuse_matmul_bias_add]   - bias_shape: {bias_shape}")
+                                    # Check if it's a 1D tensor (bias)
+                                    if len(bias_shape) == 1:
+                                        # Check if reshape operation is defined before matmul
+                                        # by comparing their positions in the block
+                                        reshape_in_block = reshape_op.block is not None
+                                        matmul_in_block = matmul_op.block is not None
+                                        
+                                        if reshape_in_block and matmul_in_block:
+                                            # Check if reshape is before matmul in the block
+                                            reshape_before_matmul = False
+                                            for op_in_block in matmul_op.block.operations:
+                                                if op_in_block == reshape_op:
+                                                    reshape_before_matmul = True
+                                                    break
+                                                if op_in_block == matmul_op:
+                                                    break
+                                            
+                                            if reshape_before_matmul:
+                                                patterns_to_fuse.append((matmul_op, reshape_op, op, bias_source))
+                                                print(f"[_fuse_matmul_bias_add]   - Added to patterns_to_fuse!")
+                                            else:
+                                                print(f"[_fuse_matmul_bias_add]   - Reshape is after matmul, skipping")
+                                        else:
+                                            print(f"[_fuse_matmul_bias_add]   - Reshape or matmul not in block, skipping")
+                
+                print(f"[_fuse_matmul_bias_add] Found {len(patterns_to_fuse)} patterns to fuse")
+                
+                # Apply fusions
+                for matmul_op, reshape_op, add_op, bias_source in patterns_to_fuse:
+                    try:
+                        # Get matmul output shape
+                        matmul_output = matmul_op.result
+                        output_shape = list(ir.RankedTensorType(matmul_output.type).shape)
+                        output_dtype = ir.RankedTensorType(matmul_output.type).element_type
+                        
+                        # Get matmul inputs and outputs from operands
+                        # matmul operands: [input_a, input_b, output_init]
+                        matmul_operands = list(matmul_op.operands)
+                        input_a = matmul_operands[0]
+                        input_b = matmul_operands[1]
+                        
+                        # Get indexing_maps attribute
+                        indexing_maps_attr = matmul_op.attributes['indexing_maps']
+                        
+                        # Get the block containing the matmul
+                        matmul_block = matmul_op.block
+                        if matmul_block is None:
+                            print(f"[Warning] Matmul operation is not in a block")
+                            continue
+                        
+                        # Use InsertionPoint to create operations before matmul
+                        with ir.InsertionPoint(matmul_op):
+                            # Get the reshape output type
+                            reshape_output_type = ir.RankedTensorType(reshape_op.result.type)
+                            reshape_output_shape = list(reshape_output_type.shape)
+                            
+                            # Check if reshape output shape matches matmul output shape
+                            # If not, we cannot fuse because linalg.matmul doesn't support broadcasting
+                            if reshape_output_shape != output_shape:
+                                print(f"[_fuse_matmul_bias_add] Skipping fusion: reshape output shape {reshape_output_shape} != matmul output shape {output_shape}")
+                                continue
+                            
+                            # Use the existing reshape operation's result as bias
+                            bias_reshaped_result = reshape_op.result
+                            
+                            # Create new matmul with bias as output
+                            new_matmul = linalg.MatmulOp(
+                                result_tensors=[ir.RankedTensorType.get(output_shape, output_dtype)],
+                                inputs=[input_a, input_b],
+                                outputs=[bias_reshaped_result],
+                                indexing_maps=indexing_maps_attr,
+                                cast="cast_signed",
+                            )
+                            linalg.fill_builtin_region(new_matmul.operation)
+                        
+                        # Replace all uses of old matmul result with new matmul result
+                        matmul_output.replace_all_uses_with(new_matmul.result)
+                        
+                        # Erase old matmul
+                        matmul_op.erase()
+                        
+                        # Erase old add operation
+                        # First, replace all uses of add result with new matmul result
+                        add_result = add_op.result
+                        add_result.replace_all_uses_with(new_matmul.result)
+                        
+                        # Erase add operation
+                        add_op.erase()
+                        
+                        # Note: We don't erase the reshape operation because it's now used by the new matmul
+                        
+                        print(f"[_fuse_matmul_bias_add] Successfully fused matmul + bias add!")
+                        
+                    except Exception as e:
+                        # If fusion fails, skip this pattern
+                        print(f"[Warning] Matmul + bias add fusion failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
 
     def lower_to_llvm_ir(self):
         """
