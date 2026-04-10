@@ -28,13 +28,14 @@
 
 #include "buddy/runtime/core/InferenceRunner.h"
 #include "buddy/runtime/core/ModelManifest.h"
+#ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
 #include "buddy/runtime/models/DeepSeekR1Runner.h"
+#endif
 
 #include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <sched.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -46,6 +47,13 @@
 //===----------------------------------------------------------------------===//
 // Affinity helpers
 //===----------------------------------------------------------------------===//
+
+#ifdef __APPLE__
+static void applyCpuAffinity(const std::string &spec) {
+  std::cerr << "[buddy-cli] Doesn't support applyCpuAffinity; --cpus ignored\n";
+}
+#else
+#include <sched.h>
 
 // Parse "0-47" or "0-15,32-47,64" into a cpu_set_t.
 static cpu_set_t parseCpuSet(const std::string &spec) {
@@ -83,6 +91,7 @@ static void applyCpuAffinity(const std::string &spec) {
   else
     std::cout << "[buddy-cli] CPU affinity set: " << spec << "\n";
 }
+#endif
 
 #ifdef BUDDY_CLI_HAVE_NUMA
 // Parse "0,1,2,3" into a numa bitmask.
@@ -139,14 +148,26 @@ static void applyNumaCpuBind(const std::string &) {
 
 static std::unique_ptr<buddy::runtime::InferenceRunner>
 makeRunner(const std::string &modelName) {
+#ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
   if (modelName.rfind("deepseek_r1", 0) == 0)
     return std::make_unique<buddy::runtime::DeepSeekR1Runner>();
+#endif
 
-  throw std::runtime_error(
-      "buddy-cli: unknown model '" + modelName +
-      "'.\n"
+#ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
+  const char *unknownHint =
       "  Supported models: deepseek_r1\n"
-      "  To add a new model, implement InferenceRunner and register it here.");
+      "  To add a new model, implement InferenceRunner and register it here.";
+#else
+  const char *unknownHint =
+      "  This buddy-cli was built without DeepSeek R1 (no model runner "
+      "linked).\n"
+      "  Re-configure with -DBUDDY_BUILD_DEEPSEEK_R1_MODEL=ON and rebuild, or "
+      "run:\n"
+      "    python3 tools/buddy-codegen/build_model.py --spec "
+      "models/deepseek_r1/specs/<variant>.json";
+#endif
+  throw std::runtime_error(std::string("buddy-cli: unknown model '") +
+                           modelName + "'.\n" + unknownHint);
 }
 
 //===----------------------------------------------------------------------===//
@@ -167,6 +188,25 @@ static void usage(const char *prog) {
       << "  --prompt     <text>      Input prompt (interactive if omitted)\n"
       << "  --max-tokens <N>         Max total tokens incl. prompt (default "
          "1024)\n"
+      << "\n"
+      << "Sampling:\n"
+      << "  --temperature <float>    Sampling temperature (0.0 = greedy, "
+         "default)\n"
+      << "  --top-k       <int>      Top-K candidates (0 = disabled)\n"
+      << "  --top-p       <float>    Nucleus sampling threshold (1.0 = "
+         "disabled)\n"
+      << "  --min-p       <float>    Min-P threshold (0.0 = disabled)\n"
+      << "  --repeat-penalty <float> Repetition penalty (1.0 = disabled)\n"
+      << "  --repeat-last-n  <int>   Repeat penalty window (default 64)\n"
+      << "  --seed        <int>      Random seed (0 = random)\n"
+      << "\n"
+      << "Chat:\n"
+      << "  --chat-template <path>   Path to chat template JSON config\n"
+      << "  --interactive            Start REPL-style interactive mode\n"
+      << "                           (--prompt becomes system prompt)\n"
+      << "\n"
+      << "Output:\n"
+      << "  --no-stats               Suppress performance statistics\n"
       << "\n"
       << "NUMA / affinity (applied before model load):\n"
       << "  --cpus       <spec>      CPU affinity, e.g. 0-47 or 0-15,32-47\n"
@@ -202,7 +242,21 @@ int main(int argc, char **argv) {
   std::string weightsPath;
   std::string vocabPath;
   std::string prompt;
-  int maxTokens = 1024;
+  int maxTokens = 4096;
+
+  // Sampling args
+  float temperature = 0.0f;
+  int topK = 0;
+  float topP = 1.0f;
+  float minP = 0.0f;
+  float repeatPenalty = 1.0f;
+  int repeatLastN = 64;
+  uint64_t seed = 0;
+
+  // Chat template & output
+  std::string chatTemplatePath;
+  bool suppressStats = false;
+  bool interactive = false;
 
   // NUMA / affinity args (applied before model load)
   std::string cpuSpec;
@@ -224,6 +278,26 @@ int main(int argc, char **argv) {
       prompt = argv[++i];
     else if (a == "--max-tokens" && i + 1 < argc)
       maxTokens = std::stoi(argv[++i]);
+    else if (a == "--temperature" && i + 1 < argc)
+      temperature = std::stof(argv[++i]);
+    else if (a == "--top-k" && i + 1 < argc)
+      topK = std::stoi(argv[++i]);
+    else if (a == "--top-p" && i + 1 < argc)
+      topP = std::stof(argv[++i]);
+    else if (a == "--min-p" && i + 1 < argc)
+      minP = std::stof(argv[++i]);
+    else if (a == "--repeat-penalty" && i + 1 < argc)
+      repeatPenalty = std::stof(argv[++i]);
+    else if (a == "--repeat-last-n" && i + 1 < argc)
+      repeatLastN = std::stoi(argv[++i]);
+    else if (a == "--seed" && i + 1 < argc)
+      seed = std::stoull(argv[++i]);
+    else if (a == "--chat-template" && i + 1 < argc)
+      chatTemplatePath = argv[++i];
+    else if (a == "--no-stats")
+      suppressStats = true;
+    else if (a == "--interactive")
+      interactive = true;
     else if (a == "--cpus" && i + 1 < argc)
       cpuSpec = argv[++i];
     else if (a == "--numa" && i + 1 < argc)
@@ -264,7 +338,7 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  if (prompt.empty()) {
+  if (prompt.empty() && !interactive) {
     std::cout << "Prompt: ";
     std::getline(std::cin, prompt);
     std::cout << "\n";
@@ -299,6 +373,16 @@ int main(int argc, char **argv) {
   cfg.vocabPath = vocabPath;
   cfg.prompt = prompt;
   cfg.maxNewTokens = maxTokens;
+  cfg.samplerConfig.temperature = temperature;
+  cfg.samplerConfig.topK = topK;
+  cfg.samplerConfig.topP = topP;
+  cfg.samplerConfig.minP = minP;
+  cfg.samplerConfig.repeatPenalty = repeatPenalty;
+  cfg.samplerConfig.repeatLastN = repeatLastN;
+  cfg.samplerConfig.seed = seed;
+  cfg.chatTemplatePath = chatTemplatePath;
+  cfg.suppressStats = suppressStats;
+  cfg.interactive = interactive;
 
   try {
     auto runner = makeRunner(modelName);
