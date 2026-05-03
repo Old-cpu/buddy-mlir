@@ -41,6 +41,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 option(LLVM_INCLUDE_TOOLS "Generate build targets for the LLVM tools." ON)
 option(LLVM_BUILD_TOOLS "Build the LLVM tools. If OFF, just generate build targets." ON)
 option(BUDDY_MLIR_OUT_OF_TREE_BUILD "Specifies an out of tree build" OFF)
+option(BUDDY_ENABLE_TESTS "Enable buddy-mlir test targets." ON)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR OR BUDDY_MLIR_OUT_OF_TREE_BUILD)
     message(STATUS "buddy-mlir two-step build.")
@@ -95,6 +96,10 @@ set(BUDDY_THIRDPARTY_INCLUDE_DIR ${BUDDY_SOURCE_DIR}/thirdparty/include)
 set(BUDDY_MLIR_PYTHON_PACKAGES_DIR ${BUDDY_BUILD_DIR}/python_packages)
 
 set(BUDDY_EXAMPLES OFF CACHE BOOL "Build examples")
+set(BUDDY_TORQ_EXAMPLES OFF CACHE BOOL
+    "Build BuddyTorq example (PyTorch->MLIR + TORQ-Tile RVV GEMM); requires RISC-V RVV toolchain")
+set(BUDDY_RUNTIME_MATMUL_TORQ OFF CACHE BOOL
+    "Build buddy_matmul_torq (runtime buddy_matmul_f32 via TORQ-Tile RVV); requires RISC-V RVV and find_package(TorqTile)")
 set(BUDDY_TRANSFORMER_EXAMPLES OFF CACHE BOOL "Build transformer examples")
 set(BUDDY_ENABLE_OPENCV OFF CACHE BOOL "Enable OpenCV support.")
 
@@ -252,14 +257,18 @@ add_subdirectory(midend)
 add_subdirectory(backend)
 add_subdirectory(tools)
 add_subdirectory(examples)
-add_subdirectory(tests)
+if(BUDDY_ENABLE_TESTS)
+  add_subdirectory(tests)
+endif()
 #-------------------------------------------------------------------------------
 # Target check-buddy
 #-------------------------------------------------------------------------------
 
-add_custom_target(check-buddy
-  DEPENDS check-examples check-tests
-)
+if(BUDDY_ENABLE_TESTS)
+  add_custom_target(check-buddy
+    DEPENDS check-examples check-tests
+  )
+endif()
 
 #-------------------------------------------------------------------------------
 # Target install
